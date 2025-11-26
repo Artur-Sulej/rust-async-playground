@@ -48,6 +48,29 @@ async fn main() {
         Err(e) => println!("Task D failed: {:?}", e),
     }
 
+    // 4. The `Sync` Trait
+    // `Sync` means it's safe for multiple threads to access `&T` concurrently.
+    // `Send` means it's safe to move `T` to another thread.
+    //
+    // To share data between tasks (which might run on different threads), we often use `Arc<T>`.
+    // `Arc<T>` is `Send` ONLY if `T` is `Sync`.
+    //
+    // Example: `String` is `Sync`, so `Arc<String>` is `Send`. We can share it.
+    use std::sync::Arc;
+    let shared_data = Arc::new("Immutable shared state".to_string());
+
+    let data_clone = shared_data.clone();
+    let handle_e = tokio::spawn(async move {
+        // We are accessing `data_clone` (which is an Arc) on a different thread.
+        // This works because `String` is `Sync`.
+        println!("Task E reading shared data: '{}'", data_clone);
+    });
+    handle_e.await.unwrap();
+
+    // Note: `std::cell::RefCell` is NOT `Sync`.
+    // If we tried to spawn a task with `Arc<RefCell<i32>>`, it would fail to compile!
+    // Because `RefCell` cannot be safely accessed from multiple threads.
+
     println!("\nEnd of main");
 }
 
