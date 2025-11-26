@@ -13,7 +13,7 @@
 //! - Handling user input (simulated) vs background work.
 
 use tokio::sync::oneshot;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{Duration, sleep, timeout};
 
 #[tokio::main]
 async fn main() {
@@ -71,6 +71,6 @@ async fn main() {
     println!("Sending stop signal...");
     let _ = tx.send(()); // Send unit to signal stop
     pinger.await.unwrap();
-    
+
     println!("Main finished.");
 }

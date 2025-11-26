@@ -17,10 +17,10 @@
 //! - **Graceful Shutdown**: Using `CancellationToken` (or just boolean flags/channels) to stop.
 //!   Here we use a simple `broadcast` channel for cancellation.
 
-use tokio::sync::{mpsc, broadcast, Semaphore};
-use tokio::time::{sleep, Duration};
-use std::sync::Arc;
 use rand::Rng;
+use std::sync::Arc;
+use tokio::sync::{Semaphore, broadcast, mpsc};
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug, Clone)]
 struct Job {
@@ -52,7 +52,7 @@ async fn main() {
         loop {
             let difficulty = rand::thread_rng().gen_range(500..1500);
             let job = Job { id, difficulty };
-            
+
             println!("[Generator] Sending Job {}...", id);
             if tx_clone.send(job).await.is_err() {
                 println!("[Generator] Receiver dropped, stopping.");
@@ -67,7 +67,7 @@ async fn main() {
     // 4. Dispatcher Loop (Main Task)
     // We run the dispatcher in a separate task or just in main.
     // Let's run it in main for simplicity, wrapped in a select with Ctrl+C.
-    
+
     println!("Press Ctrl+C to stop...");
 
     // We need to track spawned tasks to wait for them at the end.
@@ -99,7 +99,7 @@ async fn main() {
             // Wait, if we wait for permit, we block Ctrl+C?
             // No, we should put permit acquisition inside `select!`?
             // `semaphore.acquire()` is an async future.
-            
+
             permit_result = semaphore.clone().acquire_owned() => {
                 let permit = match permit_result {
                     Ok(p) => p,
@@ -113,14 +113,14 @@ async fn main() {
                 //
                 // BUT, if we want to handle Ctrl+C while waiting for a job?
                 // We need another select! inside? Or just break the outer loop structure?
-                
+
                 // Let's try to get a job.
                 match rx.recv().await {
                     Some(job) => {
                         let mut shutdown_rx = shutdown_tx.subscribe();
                         let handle = tokio::spawn(async move {
                             println!("[Worker] Got Job {} (Difficulty: {}ms)", job.id, job.difficulty);
-                            
+
                             // Simulate work with cancellation support
                             tokio::select! {
                                 _ = sleep(Duration::from_millis(job.difficulty)) => {
@@ -130,7 +130,7 @@ async fn main() {
                                     println!("[Worker] Job {} Cancelled!", job.id);
                                 }
                             }
-                            
+
                             // Permit is dropped here, allowing a new worker to start.
                             drop(permit);
                         });

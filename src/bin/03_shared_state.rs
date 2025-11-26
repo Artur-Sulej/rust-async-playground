@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[tokio::main]
 async fn main() {
@@ -40,7 +40,7 @@ async fn main() {
                 let read_guard = db_clone.read().await;
                 println!("[Reader {}] Keys: {:?}", i, read_guard.keys());
                 // Drop the guard automatically when it goes out of scope
-                drop(read_guard); 
+                drop(read_guard);
                 sleep(Duration::from_millis(100)).await;
             }
         }));

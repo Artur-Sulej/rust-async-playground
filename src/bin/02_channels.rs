@@ -13,7 +13,7 @@
 //! spawns a worker task and sends it commands.
 
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug)]
 enum Command {
@@ -55,9 +55,11 @@ async fn main() {
 
     // The "Manager" (main task) sends commands.
     // We can clone `tx` if we had multiple producers, but here we just use the original.
-    
+
     println!("[Manager] Sending Print command...");
-    tx.send(Command::Print("Hello from main!".to_string())).await.unwrap();
+    tx.send(Command::Print("Hello from main!".to_string()))
+        .await
+        .unwrap();
 
     println!("[Manager] Sending Add commands...");
     tx.send(Command::Add(10, 20)).await.unwrap();
@@ -71,6 +73,6 @@ async fn main() {
 
     // Wait for the worker to finish
     worker_handle.await.unwrap();
-    
+
     println!("[Manager] All done.");
 }

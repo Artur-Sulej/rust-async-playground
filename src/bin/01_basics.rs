@@ -28,19 +28,14 @@ async fn main() {
     // 2. Concurrency with `tokio::join!`
     // We can run multiple futures concurrently on the SAME task.
     println!("\nStarting Task B and Task C concurrently...");
-    let (res_b, res_c) = tokio::join!(
-        do_work("Task B", 2),
-        do_work("Task C", 1)
-    );
+    let (res_b, res_c) = tokio::join!(do_work("Task B", 2), do_work("Task C", 1));
     println!("Joined tasks finished: B={}, C={}", res_b, res_c);
 
     // 3. Spawning background tasks with `tokio::spawn`
     // This creates a NEW task that can run in parallel on a different thread.
     // The return value is a `JoinHandle`.
     println!("\nSpawning background Task D...");
-    let handle_d = tokio::spawn(async {
-        do_work("Task D (background)", 3).await
-    });
+    let handle_d = tokio::spawn(async { do_work("Task D (background)", 3).await });
 
     // We can continue doing other work in main while Task D runs.
     println!("Main is doing other work...");
