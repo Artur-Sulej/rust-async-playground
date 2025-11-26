@@ -4,17 +4,20 @@
 //!
 //! Architecture:
 //! - `Job`: A struct representing work to be done.
-//! - `JobQueue`: A shared queue (channel) of jobs.
-//! - `Worker`: A task that pulls jobs from the queue and processes them.
-//! - `JobGenerator`: A task that creates jobs and pushes them to the queue.
-//! - `Graceful Shutdown`: Handling Ctrl+C or a stop signal to clean up.
+//! - `JobGenerator`: A task that creates jobs and pushes them to a queue.
+//! - `JobQueue`: A `mpsc` channel.
+//! - `Dispatcher`: The main loop that pulls jobs and spawns workers.
+//! - `Concurrency Control`: Using `tokio::sync::Semaphore` to limit the number of active workers.
+//! - `Graceful Shutdown`: Handling Ctrl+C to stop the generator and wait for workers.
 //!
 //! Concepts:
-//! - Structuring async applications.
-//! - Using `tokio::signal::ctrl_c` for shutdown.
-//! - `broadcast` channel for sending shutdown signals to multiple workers.
+//! - **Backpressure**: If the workers are slow, the semaphore fills up. The dispatcher waits.
+//!   Then the channel fills up. Then the generator waits.
+//! - **Semaphore**: Limiting concurrency (e.g., max 3 concurrent jobs).
+//! - **Graceful Shutdown**: Using `CancellationToken` (or just boolean flags/channels) to stop.
+//!   Here we use a simple `broadcast` channel for cancellation.
 
-use tokio::sync::{mpsc, broadcast};
+use tokio::sync::{mpsc, broadcast, Semaphore};
 use tokio::time::{sleep, Duration};
 use std::sync::Arc;
 use rand::Rng;
@@ -27,279 +30,132 @@ struct Job {
 
 #[tokio::main]
 async fn main() {
-    // Initialize logging (simple print here, but in real apps use tracing)
     println!("--- Job Processor App Starting ---");
 
     // 1. Setup Channels
-    // mpsc for jobs: Many producers (generators), Single consumer (worker pool shared rx? No, mpsc is single consumer).
-    // Actually, for a worker pool with mpsc, we can't share the Receiver among threads easily unless we wrap it in a Mutex,
-    // OR we just have one "Dispatcher" task that distributes work,
-    // OR we use `async-channel` or `flume` which support MPC (Multi-Producer Multi-Consumer).
-    // BUT, with Tokio mpsc, a common pattern is:
-    //   - One receiver task that distributes to workers?
-    //   - OR, we just spawn one task per job?
-    //   - OR, we use `Arc<Mutex<mpsc::Receiver>>`? (A bit slow due to locking)
-    //   - OR, we use `tokio::sync::broadcast`? No, that sends same msg to all.
-    //
-    // Let's use the `Arc<Mutex<Receiver>>` pattern for simplicity in this playground to show shared state + channels,
-    // even though it's not the highest performance.
-    // Alternatively, we can just have 1 Worker task that handles everything concurrently? No, we want parallel processing.
-    //
-    // Better approach for this playground:
-    // Use `async-channel` crate? No, I want to stick to Tokio.
-    // Let's use a "Dispatcher" pattern.
-    // 1 Receiver -> Dispatcher -> spawns tasks or sends to specific worker channels.
-    //
-    // Simpler: Just have the `JobGenerator` spawn tasks directly? No, we want to limit concurrency.
-    //
-    // Let's go with: `Arc<Mutex<mpsc::Receiver>>`. It's a valid pattern for simple worker pools.
-    
-    let (tx, rx) = mpsc::channel::<Job>(100);
-    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+    // Channel capacity = 10. If we have >10 pending jobs, generator will sleep.
+    let (tx, mut rx) = mpsc::channel::<Job>(10);
 
-    // Broadcast channel for shutdown signal
+    // Broadcast channel for shutdown signal to workers (if we needed to cancel them mid-job).
+    // In this pattern, we might just let them finish.
+    // But let's keep it to show how to broadcast "stop".
     let (shutdown_tx, _) = broadcast::channel(1);
 
-    // 2. Spawn Workers
-    let num_workers = 3;
-    let mut worker_handles = vec![];
-
-    for id in 1..=num_workers {
-        let rx_clone = rx.clone();
-        let mut shutdown_rx = shutdown_tx.subscribe();
-        
-        worker_handles.push(tokio::spawn(async move {
-            println!("[Worker {}] Started.", id);
-            loop {
-                // We need to be careful with cancellation here.
-                // We want to select on shutdown OR getting a job.
-                // But `rx_clone.lock().await.recv()` is a two-step process.
-                // If we lock, we hold the lock.
-                //
-                // Correct way with shared receiver:
-                // Lock, then recv.
-                
-                let job = {
-                    // Scope for lock
-                    let mut lock = rx_clone.lock().await;
-                    // We use `recv` which is async.
-                    // If we select! on this, we are holding the lock while waiting!
-                    // This prevents other workers from getting the lock.
-                    // BAD PATTERN ALERT!
-                    //
-                    // Okay, so `Arc<Mutex<Receiver>>` is bad if we await inside the lock.
-                    //
-                    // Better Pattern:
-                    // Use `tokio::sync::Semaphore` to limit concurrency, and just `tokio::spawn` for every job?
-                    // That's a very "Tokio" way.
-                    //
-                    // Let's pivot the design to "Semaphore-limited Spawning".
-                    // The "Worker" is just a permit.
-                    //
-                    // OR, let's just use a single Consumer that distributes work to a pool of channels?
-                    // Too complex for a playground.
-                    //
-                    // Let's stick to `mpsc` but with a single "Manager" task that pulls from queue and spawns a task for each job,
-                    // limiting concurrency with a Semaphore.
-                    
-                    // Actually, let's just use `try_recv`? No.
-                    
-                    // Let's go back to basics.
-                    // A single consumer loop that spawns tasks?
-                    // Yes.
-                    
-                    // But I want to show "Worker Pool".
-                    //
-                    // Okay, let's use `tokio::sync::mpsc` but give each worker its OWN channel?
-                    // Then we need a load balancer.
-                    //
-                    // Let's use the "Semaphore" pattern. It's cleaner in Tokio.
-                    // We have a `JobQueue` (mpsc).
-                    // We have a `Manager` loop that:
-                    //   1. Acquires a permit from a Semaphore (limit 3).
-                    //   2. Recv job.
-                    //   3. Spawn a task (move permit into task).
-                    // This effectively creates a worker pool of size 3.
-                    
-                    // Wait, if I want to show "Worker Tasks" explicitly (long running),
-                    // I should probably use `async-channel` (MPMC) but I can't add dependencies now easily without asking user.
-                    //
-                    // Let's use the `Arc<Mutex<Receiver>>` but with `try_recv`? No.
-                    //
-                    // Let's use the "Manager spawns tasks" pattern. It's very idiomatic.
-                    
-                    // REVISION:
-                    // I will implement the "Manager with Semaphore" pattern.
-                    // It demonstrates `tokio::sync::Semaphore`.
-                    
-                    // Wait, I didn't list Semaphore in the plan.
-                    // I'll stick to the plan of "JobQueue, Workers".
-                    //
-                    // How about:
-                    // `JobGenerator` -> `mpsc` -> `Manager`
-                    // `Manager` -> `mpsc` -> `Worker 1`
-                    // `Manager` -> `mpsc` -> `Worker 2`
-                    // ...
-                    // Round-robin distribution.
-                    // This shows sending to specific tasks.
-                    
-                    // Let's do that. It's a good pattern.
-                    
-                    // Actually, simpler:
-                    // Just 1 Worker for this example? No, "Workers".
-                    //
-                    // Let's just use `std::sync::Mutex` for the receiver?
-                    // No, `recv` is async.
-                    //
-                    // Okay, I will use the "Manager spawns tasks" pattern.
-                    // It is the most robust "Worker Pool" in Tokio without extra crates.
-                    
-                    // But wait, the user asked for "Tasks, channels".
-                    //
-                    // Let's do:
-                    // 1. Generator produces to `tx`.
-                    // 2. `Manager` consumes `rx`.
-                    // 3. `Manager` maintains a list of `Worker` channels.
-                    // 4. `Manager` round-robins jobs to workers.
-                    
-                    // This is great.
-                    
-                    // Wait, I need to handle shutdown.
-                    
-                    // Let's write the code.
-                    
-                    // ... (Writing code in thought) ...
-                    // Actually, I'll just implement the "Manager spawns tasks" pattern.
-                    // It's simpler to write and robust.
-                    // "Worker" here is just a spawned task processing a job.
-                    // The "Concurrency Limit" is the "Pool Size".
-                    
-                    // Let's call it "Worker Pool" via Semaphore.
-                    
-                    // Wait, I want to show `select!` with shutdown.
-                    // If I just spawn tasks, the main loop needs to handle shutdown.
-                    
-                    // Okay, plan:
-                    // Main task:
-                    // - Spawn Generator.
-                    // - Loop:
-                    //   - select!
-                    //     - msg = rx.recv() => spawn job (acquire permit)
-                    //     - _ = ctrl_c => start shutdown
-                    
-                    // This is good.
-                    
-                    // But I want to show explicit "Worker" struct/task if possible?
-                    // No, functional approach is fine.
-                    
-                    // Let's stick to the "Manager spawns tasks" pattern.
-                    
-                    // Wait, I'll add `tokio::sync::Semaphore` to the imports.
-                    
-                    // Let's refine the "Worker" concept.
-                    // Maybe I can just have 3 tasks that share a `Arc<Mutex<Receiver>>` but use `try_recv` in a loop with sleep?
-                    // That's "polling", which is bad.
-                    
-                    // Okay, I will use `tokio-stream`? No.
-                    
-                    // Let's use the `Arc<Mutex<mpsc::Receiver>>` pattern but accept the lock contention.
-                    // For a playground, it's fine to show "This is how you share a receiver, but beware of contention".
-                    // It's a valid learning point.
-                    // And I will use `lock().await` then `recv().await`.
-                    // Yes, it holds the lock while waiting. This effectively serializes the workers.
-                    // So they won't process in parallel if the queue is empty?
-                    // No, if the queue is empty, one worker holds the lock and waits. Others are blocked on lock.
-                    // When a job comes, the holder gets it, releases lock.
-                    // Then next worker gets lock.
-                    // This works! It just means only one worker can be *waiting* for a job at a time.
-                    // But once they have a job, they release the lock and process it in parallel.
-                    // So `lock().await; let job = rx.recv().await; drop(lock); process(job);`
-                    // This allows parallel processing!
-                    // The only serialization is on *fetching* the job.
-                    // Which is totally fine.
-                    
-                    // So I will use `Arc<Mutex<Receiver>>`.
-                    
-                    lock.recv().await
-                }; // Lock dropped here
-
-                match job {
-                    Some(j) => {
-                        println!("[Worker {}] Got Job {}. Processing...", id, j.id);
-                        // Simulate work
-                        sleep(Duration::from_millis(j.difficulty)).await;
-                        println!("[Worker {}] Job {} Finished.", id, j.id);
-                    }
-                    None => {
-                        println!("[Worker {}] Queue closed.", id);
-                        break;
-                    }
-                }
-                
-                // Check for shutdown signal
-                // We use `try_recv` on broadcast to see if we should stop?
-                // Or just select?
-                // We can't select easily because we are inside the loop doing work.
-                // We check shutdown after work?
-                if shutdown_rx.try_recv().is_ok() {
-                     println!("[Worker {}] Shutdown signal.", id);
-                     break;
-                }
-            }
-        }));
-    }
+    // 2. Concurrency Control
+    // We want at most 3 concurrent jobs.
+    let semaphore = Arc::new(Semaphore::new(3));
 
     // 3. Spawn Job Generator
     let tx_clone = tx.clone();
     let generator_handle = tokio::spawn(async move {
         let mut id = 0;
         loop {
-            let difficulty = rand::thread_rng().gen_range(100..500);
+            let difficulty = rand::thread_rng().gen_range(500..1500);
             let job = Job { id, difficulty };
             
+            println!("[Generator] Sending Job {}...", id);
             if tx_clone.send(job).await.is_err() {
                 println!("[Generator] Receiver dropped, stopping.");
                 break;
             }
-            println!("[Generator] Sent Job {}", id);
             id += 1;
-            sleep(Duration::from_millis(200)).await;
+            // Generate faster than workers to demonstrate backpressure
+            sleep(Duration::from_millis(100)).await;
         }
     });
 
-    // 4. Wait for Ctrl+C or run for a fixed time
-    println!("Running for 5 seconds... (Press Ctrl+C to stop early)");
+    // 4. Dispatcher Loop (Main Task)
+    // We run the dispatcher in a separate task or just in main.
+    // Let's run it in main for simplicity, wrapped in a select with Ctrl+C.
     
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nCtrl+C received!");
-        }
-        _ = sleep(Duration::from_secs(5)) => {
-            println!("\nTime's up!");
+    println!("Press Ctrl+C to stop...");
+
+    // We need to track spawned tasks to wait for them at the end.
+    // A `JoinSet` is perfect for this (Tokio 1.20+), but let's use a Vec for simplicity/older versions compatibility
+    // or just rely on the semaphore to know when we are drained?
+    // Actually, `JoinSet` is great. Let's use it if we assume recent Tokio.
+    // But to keep it "classic", let's just use a simple counter or vector of handles.
+    // Since we detach them (fire and forget), we can't easily `await` them all unless we store handles.
+    // Let's store handles.
+    let mut worker_handles = vec![];
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n[Dispatcher] Ctrl+C received! Shutting down...");
+                break;
+            }
+            // Wait for a job AND a permit
+            // We need to be careful. If we get a job but no permit, we shouldn't drop the job.
+            // Correct pattern: Acquire permit first?
+            // If we acquire permit, then wait for job... if no job comes (shutdown), we drop permit.
+            //
+            // But `rx.recv()` is cancel-safe. `semaphore.acquire()` is cancel-safe.
+            //
+            // Let's do:
+            // 1. Acquire permit.
+            // 2. Recv job.
+            //
+            // Wait, if we wait for permit, we block Ctrl+C?
+            // No, we should put permit acquisition inside `select!`?
+            // `semaphore.acquire()` is an async future.
+            
+            permit_result = semaphore.clone().acquire_owned() => {
+                let permit = match permit_result {
+                    Ok(p) => p,
+                    Err(_) => break, // Semaphore closed
+                };
+
+                // Now we have a permit. Try to get a job.
+                // We use `rx.recv()` here.
+                // NOTE: If generator is slow, we hold the permit while waiting for job.
+                // This is fine, it just means "we are ready to work".
+                //
+                // BUT, if we want to handle Ctrl+C while waiting for a job?
+                // We need another select! inside? Or just break the outer loop structure?
+                
+                // Let's try to get a job.
+                match rx.recv().await {
+                    Some(job) => {
+                        let mut shutdown_rx = shutdown_tx.subscribe();
+                        let handle = tokio::spawn(async move {
+                            println!("[Worker] Got Job {} (Difficulty: {}ms)", job.id, job.difficulty);
+                            
+                            // Simulate work with cancellation support
+                            tokio::select! {
+                                _ = sleep(Duration::from_millis(job.difficulty)) => {
+                                    println!("[Worker] Job {} Finished.", job.id);
+                                }
+                                _ = shutdown_rx.recv() => {
+                                    println!("[Worker] Job {} Cancelled!", job.id);
+                                }
+                            }
+                            
+                            // Permit is dropped here, allowing a new worker to start.
+                            drop(permit);
+                        });
+                        worker_handles.push(handle);
+                    }
+                    None => {
+                        println!("[Dispatcher] Queue is empty and closed.");
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    // 5. Graceful Shutdown
-    println!("Starting Graceful Shutdown...");
-    
-    // Stop generator
-    generator_handle.abort(); 
-    
-    // Signal workers
+    // 5. Shutdown Sequence
+    println!("[Shutdown] Stopping generator...");
+    generator_handle.abort();
+
+    println!("[Shutdown] notifying workers...");
     let _ = shutdown_tx.send(());
-    
-    // Wait for workers to finish their current loop
-    // (In a real app, we might close the channel `tx` too, so workers drain it)
-    // Let's close the channel to signal "no more jobs"
-    drop(tx); // Drop our sender. Generator is aborted, so its sender is gone.
-    // But `rx` is shared in Arc<Mutex>, so it won't close until all senders are gone.
-    // We dropped `tx` here. Generator `tx` is gone.
-    // So `rx.recv()` will return None eventually?
-    // Yes, if we didn't have the `shutdown_tx` check, they would drain the queue.
-    
-    for h in worker_handles {
-        let _ = h.await;
+
+    println!("[Shutdown] Waiting for active workers to finish/cancel...");
+    for handle in worker_handles {
+        let _ = handle.await;
     }
-    
-    println!("All workers stopped. App exited.");
+
+    println!("[Shutdown] All done.");
 }

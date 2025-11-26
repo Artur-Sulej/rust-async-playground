@@ -51,3 +51,8 @@ cargo run --bin 05_mini_app
 - **anyhow**: Easy error handling.
 - **tracing**: Structured logging (used simply here).
 - **rand**: For simulation randomness.
+
+## Further Reading
+
+- [Asynchronous Programming in Rust](https://rust-lang.github.io/async-book/): The definitive guide to the "why" and "how" of async (Futures, Pin, Waker).
+- [Tokio Tutorial](https://tokio.rs/tokio/tutorial): Excellent official tutorial for the runtime.
